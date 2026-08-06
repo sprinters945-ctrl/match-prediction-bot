@@ -154,11 +154,11 @@ def is_admin(user_id: int) -> bool:
 async def fetch_matches(client: httpx.AsyncClient):
     """
     Returns a normalized list of dicts: [{id, status, matchType, teams: [a,b]}, ...]
-    Pulls from Cricbuzz's /matches/live endpoint (live + upcoming + recent
+    Pulls from Cricbuzz's /matches/v1/live endpoint (live + upcoming + recent
     are usually grouped under typeMatches -> seriesMatches -> matches).
     Verify this shape in RapidAPI's Playground before first real run.
     """
-    r = await client.get(f"{CRICBUZZ_BASE}/matches/live", headers=CRICBUZZ_HEADERS)
+    r = await client.get(f"{CRICBUZZ_BASE}/matches/v1/live", headers=CRICBUZZ_HEADERS)
     r.raise_for_status()
     raw = r.json()
 
