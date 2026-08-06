@@ -1,6 +1,6 @@
 """
-Sanju Baba - Match Prediction / Fantasy Poll Bot (FULLY AUTOMATED)
---------------------------------------------------------------------
+Sanju Baba - Match Prediction / Fantasy Poll Bot (GROUP VERSION - FULLY AUTOMATED)
+--------------------------------------------------------------------------------------
 Starting se ending tak automated:
   1. Har few minutes me CricketData.org se live/upcoming matches check karta hai
   2. Jab toss ho jaata hai (status me "Toss" aata hai) -> squad fetch karke
@@ -11,11 +11,20 @@ Starting se ending tak automated:
      command se confirm karega: /mom <match_id> <player name>
      Uske turant baad MOM scoring + final leaderboard bhi auto-post ho jaata hai
 
-IMPORTANT: CricketData.org ke exact JSON field names unke dashboard/docs se
-match kar lena pehli run se pehle (CRICKETDATA_MATCHES_URL etc niche define
-kiye hain standard v1 endpoints ke hisaab se) - agar unka schema thoda alag
-nikle to sirf `fetch_matches`, `fetch_squad`, `fetch_result` functions me
-field names adjust karne honge, baaki logic same rahega.
+Uses NATIVE Telegram polls (non-anonymous) - this only works in a GROUP.
+Telegram channels only allow anonymous polls, so if you switch to a channel
+later, use the button-based version instead (per-user vote tracking needs
+either a non-anonymous poll or inline buttons).
+
+DATA SOURCE: RapidAPI's "Cricbuzz Cricket" API (cricbuzz-cricket.p.rapidapi.com)
+instead of CricketData.org. Sign up at rapidapi.com, subscribe to the
+Cricbuzz Cricket API's free tier, and use your RapidAPI key.
+
+IMPORTANT: this is an unofficial API wrapping Cricbuzz's own site - exact
+JSON field names should be checked against RapidAPI's Playground for this
+API before your first real run (fetch_matches / fetch_squad / fetch_result
+functions below are where those field names live). If a field differs,
+only these three functions need adjusting, baaki logic same rahega.
 
 Deploy: hamesha-on host chahiye (Railway/Render/VPS). GitHub Actions cron
 is NOT suitable - ye bot continuously polls dono Telegram aur CricketData.org.
@@ -36,12 +45,12 @@ from telegram.ext import (
 )
 
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("auto-prediction-bot")
+log = logging.getLogger("group-prediction-bot")
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 GROUP_CHAT_ID = int(os.environ["GROUP_CHAT_ID"])
 ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()}
-CRICKETDATA_API_KEY = os.environ["CRICKETDATA_API_KEY"]
+RAPIDAPI_KEY = os.environ["RAPIDAPI_KEY"]
 
 DB_PATH = os.environ.get("DB_PATH", "predictions.db")
 CHECK_INTERVAL_MINUTES = int(os.environ.get("CHECK_INTERVAL_MINUTES", "10"))
@@ -50,9 +59,13 @@ POINTS_WINNER = 10
 POINTS_SCORE = 15
 POINTS_MOM = 20
 
-CRICKETDATA_BASE = "https://api.cricapi.com/v1"
+CRICBUZZ_HOST = "cricbuzz-cricket.p.rapidapi.com"
+CRICBUZZ_BASE = f"https://{CRICBUZZ_HOST}"
+CRICBUZZ_HEADERS = {
+    "X-RapidAPI-Host": CRICBUZZ_HOST,
+    "X-RapidAPI-Key": RAPIDAPI_KEY,
+}
 
-# Only fully-limited-overs formats get a score-range poll (Test excluded)
 SCORE_BUCKETS = {
     "t20": [140, 160, 180, 200],
     "odi": [220, 260, 300],
@@ -74,17 +87,17 @@ def init_db():
         """
         CREATE TABLE IF NOT EXISTS matches (
             match_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            cd_match_id TEXT UNIQUE,   -- CricketData.org's match id
+            cd_match_id TEXT UNIQUE,
             team_a TEXT, team_b TEXT,
-            match_type TEXT,           -- t20 / odi / test
-            score_buckets TEXT,        -- comma separated thresholds
-            mom_players TEXT,          -- comma separated
+            match_type TEXT,
+            score_buckets TEXT,
+            mom_players TEXT,
             winner_poll_id TEXT,
             score_poll_id TEXT,
             mom_poll_id TEXT,
             polls_posted INTEGER DEFAULT 0,
             resolved INTEGER DEFAULT 0,
-            mom_pending INTEGER DEFAULT 0,  -- winner/score scored, waiting on admin MOM
+            mom_pending INTEGER DEFAULT 0,
             actual_winner TEXT,
             actual_score_bucket TEXT,
             actual_mom TEXT,
@@ -135,53 +148,84 @@ def is_admin(user_id: int) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# CricketData.org calls
+# RapidAPI - Cricbuzz Cricket calls
 # ---------------------------------------------------------------------------
 
 async def fetch_matches(client: httpx.AsyncClient):
-    """Returns list of current/upcoming matches with status."""
-    r = await client.get(
-        f"{CRICKETDATA_BASE}/currentMatches",
-        params={"apikey": CRICKETDATA_API_KEY, "offset": 0},
-    )
+    """
+    Returns a normalized list of dicts: [{id, status, matchType, teams: [a,b]}, ...]
+    Pulls from Cricbuzz's /matches/v1/live endpoint (live + upcoming + recent
+    are usually grouped under typeMatches -> seriesMatches -> matches).
+    Verify this shape in RapidAPI's Playground before first real run.
+    """
+    r = await client.get(f"{CRICBUZZ_BASE}/matches/v1/live", headers=CRICBUZZ_HEADERS)
     r.raise_for_status()
-    return r.json().get("data", [])
+    raw = r.json()
+
+    matches = []
+    for type_block in raw.get("typeMatches", []):
+        for series_block in type_block.get("seriesMatches", []):
+            wrapper = series_block.get("seriesAdWrapper") or series_block
+            for m in wrapper.get("matches", []):
+                info = m.get("matchInfo", {})
+                team1 = info.get("team1", {}).get("teamName")
+                team2 = info.get("team2", {}).get("teamName")
+                if not team1 or not team2:
+                    continue
+                matches.append({
+                    "id": str(info.get("matchId")),
+                    "status": (info.get("status") or "").lower(),
+                    "matchType": (info.get("matchFormat") or "").lower(),  # e.g. "t20", "odi", "test"
+                    "matchStarted": info.get("state", "").lower() not in ("preview", ""),
+                    "teams": [team1, team2],
+                })
+    return matches
 
 
 async def fetch_squad(client: httpx.AsyncClient, cd_match_id: str):
-    """Returns list of player names for MOM poll options."""
-    r = await client.get(
-        f"{CRICKETDATA_BASE}/match_squad",
-        params={"apikey": CRICKETDATA_API_KEY, "id": cd_match_id},
-    )
+    """Returns player names for MOM options, from the match center's squads."""
+    r = await client.get(f"{CRICBUZZ_BASE}/mcenter/v1/{cd_match_id}", headers=CRICBUZZ_HEADERS)
     r.raise_for_status()
-    data = r.json().get("data", [])
+    data = r.json()
+
     players = []
-    for team in data:
-        for p in team.get("players", []):
-            players.append(p.get("name"))
-    # Telegram polls max out at 10 options - trim if squad list is long
-    return players[:10] if players else []
+    for key in ("team1", "team2"):
+        team = data.get("matchInfo", {}).get(key, {})
+        for p in team.get("playerDetails", []) or team.get("players", []):
+            name = p.get("name") or p.get("fullName")
+            if name:
+                players.append(name)
+    return players[:10] if players else []  # Telegram poll option limit is 10
 
 
 async def fetch_result(client: httpx.AsyncClient, cd_match_id: str):
     """Returns (winner_team_name, winning_score_runs) once match has ended, else None."""
-    r = await client.get(
-        f"{CRICKETDATA_BASE}/match_info",
-        params={"apikey": CRICKETDATA_API_KEY, "id": cd_match_id},
-    )
+    r = await client.get(f"{CRICBUZZ_BASE}/mcenter/v1/{cd_match_id}", headers=CRICBUZZ_HEADERS)
     r.raise_for_status()
-    info = r.json().get("data", {})
-    if info.get("matchStarted") and info.get("matchEnded"):
-        winner = info.get("matchWinner")
-        # score is usually a list like [{"inning": "...", "r": 187, ...}, ...]
-        # take the winning team's innings total
-        top_score = 0
-        for s in info.get("score", []):
-            if winner and winner in s.get("inning", ""):
-                top_score = max(top_score, s.get("r", 0))
-        return winner, top_score
-    return None
+    data = r.json()
+    info = data.get("matchInfo", {})
+
+    state = (info.get("state") or "").lower()
+    if state not in ("complete", "completed"):
+        return None
+
+    winner = None
+    result_text = (info.get("status") or "")
+    for team_key in ("team1", "team2"):
+        team_name = info.get(team_key, {}).get("teamName")
+        if team_name and team_name.lower() in result_text.lower():
+            winner = team_name
+            break
+    if not winner:
+        return None
+
+    top_score = 0
+    for inning in data.get("scoreCard", []):
+        batting_team = inning.get("batTeamDetails", {}).get("batTeamName", "")
+        if winner.lower() in batting_team.lower():
+            top_score = max(top_score, inning.get("scoreDetails", {}).get("runs", 0))
+
+    return winner, top_score
 
 
 # ---------------------------------------------------------------------------
@@ -211,7 +255,6 @@ async def poll_cycle(context: ContextTypes.DEFAULT_TYPE):
                 "SELECT * FROM matches WHERE cd_match_id=?", (cd_id,)
             ).fetchone()
 
-            # --- Case 1: not tracked yet, and toss has happened -> post polls ---
             toss_done = "toss" in status or "elected" in status or m.get("matchStarted")
             if not existing and toss_done and match_type in SCORE_BUCKETS:
                 try:
@@ -220,7 +263,7 @@ async def poll_cycle(context: ContextTypes.DEFAULT_TYPE):
                     log.error(f"fetch_squad failed for {cd_id}: {e}")
                     players = []
                 if len(players) < 2:
-                    continue  # squad not ready yet, try again next cycle
+                    continue
 
                 thresholds = SCORE_BUCKETS[match_type]
                 buckets = make_buckets(thresholds)
@@ -260,7 +303,6 @@ async def poll_cycle(context: ContextTypes.DEFAULT_TYPE):
                 log.info(f"Posted polls for match #{match_id} ({team_a} vs {team_b})")
                 continue
 
-            # --- Case 2: tracked, polls posted, not resolved -> check if match ended ---
             if existing and existing["polls_posted"] and not existing["resolved"]:
                 try:
                     result = await fetch_result(client, cd_id)
@@ -382,7 +424,6 @@ async def leaderboard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def pending_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Shows matches waiting on admin's /mom command."""
     conn = db()
     rows = conn.execute(
         "SELECT match_id, team_a, team_b FROM matches WHERE mom_pending=1"
@@ -442,7 +483,7 @@ def main():
 
     app.job_queue.run_repeating(poll_cycle, interval=CHECK_INTERVAL_MINUTES * 60, first=10)
 
-    log.info("Auto bot starting...")
+    log.info("Group bot starting...")
     app.run_polling()
 
 
