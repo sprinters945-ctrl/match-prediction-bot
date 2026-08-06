@@ -53,7 +53,7 @@ ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.str
 RAPIDAPI_KEY = os.environ["RAPIDAPI_KEY"]
 
 DB_PATH = os.environ.get("DB_PATH", "predictions.db")
-CHECK_INTERVAL_MINUTES = int(os.environ.get("CHECK_INTERVAL_MINUTES", "10"))
+CHECK_INTERVAL_MINUTES = int(os.environ.get("CHECK_INTERVAL_MINUTES", "720"))  # default: 2x/day, to stay within RapidAPI free tier's 100 requests/month
 
 POINTS_WINNER = 10
 POINTS_SCORE = 15
