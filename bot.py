@@ -154,11 +154,11 @@ def is_admin(user_id: int) -> bool:
 async def fetch_matches(client: httpx.AsyncClient):
     """
     Returns a normalized list of dicts: [{id, status, matchType, teams: [a,b]}, ...]
-    Pulls from Cricbuzz's /matches/v1/live endpoint (live + upcoming + recent
+    Pulls from Cricbuzz's /matches/live endpoint (live + upcoming + recent
     are usually grouped under typeMatches -> seriesMatches -> matches).
     Verify this shape in RapidAPI's Playground before first real run.
     """
-    r = await client.get(f"{CRICBUZZ_BASE}/matches/v1/live", headers=CRICBUZZ_HEADERS)
+    r = await client.get(f"{CRICBUZZ_BASE}/matches/live", headers=CRICBUZZ_HEADERS)
     r.raise_for_status()
     raw = r.json()
 
@@ -172,11 +172,13 @@ async def fetch_matches(client: httpx.AsyncClient):
                 team2 = info.get("team2", {}).get("teamName")
                 if not team1 or not team2:
                     continue
+                state = (info.get("state") or "").lower()
                 matches.append({
                     "id": str(info.get("matchId")),
                     "status": (info.get("status") or "").lower(),
-                    "matchType": (info.get("matchFormat") or "").lower(),  # e.g. "t20", "odi", "test"
-                    "matchStarted": info.get("state", "").lower() not in ("preview", ""),
+                    "matchType": (info.get("matchFormat") or "").lower(),  # "test", "t20", "odi"
+                    # toss (or later) has happened once state moves off "preview"/"scheduled"
+                    "matchStarted": state not in ("preview", "scheduled", ""),
                     "teams": [team1, team2],
                 })
     return matches
@@ -206,24 +208,28 @@ async def fetch_result(client: httpx.AsyncClient, cd_match_id: str):
     info = data.get("matchInfo", {})
 
     state = (info.get("state") or "").lower()
-    if state not in ("complete", "completed"):
+    if state != "complete":
         return None
 
-    winner = None
     result_text = (info.get("status") or "")
-    for team_key in ("team1", "team2"):
-        team_name = info.get(team_key, {}).get("teamName")
-        if team_name and team_name.lower() in result_text.lower():
-            winner = team_name
-            break
+    team1_name = info.get("team1", {}).get("teamName", "")
+    team2_name = info.get("team2", {}).get("teamName", "")
+
+    winner = None
+    if team1_name and team1_name.lower() in result_text.lower():
+        winner = team1_name
+    elif team2_name and team2_name.lower() in result_text.lower():
+        winner = team2_name
     if not winner:
         return None
 
-    top_score = 0
-    for inning in data.get("scoreCard", []):
-        batting_team = inning.get("batTeamDetails", {}).get("batTeamName", "")
-        if winner.lower() in batting_team.lower():
-            top_score = max(top_score, inning.get("scoreDetails", {}).get("runs", 0))
+    # matchScore holds each team's innings (team1Score / team2Score -> inngs1/inngs2 -> runs)
+    score_key = "team1Score" if winner == team1_name else "team2Score"
+    team_score = data.get("matchScore", {}).get(score_key, {})
+    top_score = max(
+        (inning.get("runs", 0) for inning in team_score.values() if isinstance(inning, dict)),
+        default=0,
+    )
 
     return winner, top_score
 
