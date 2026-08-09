@@ -16,15 +16,9 @@ Telegram channels only allow anonymous polls, so if you switch to a channel
 later, use the button-based version instead (per-user vote tracking needs
 either a non-anonymous poll or inline buttons).
 
-DATA SOURCE: RapidAPI's "Cricbuzz Cricket" API (cricbuzz-cricket.p.rapidapi.com)
-instead of CricketData.org. Sign up at rapidapi.com, subscribe to the
-Cricbuzz Cricket API's free tier, and use your RapidAPI key.
-
-IMPORTANT: this is an unofficial API wrapping Cricbuzz's own site - exact
-JSON field names should be checked against RapidAPI's Playground for this
-API before your first real run (fetch_matches / fetch_squad / fetch_result
-functions below are where those field names live). If a field differs,
-only these three functions need adjusting, baaki logic same rahega.
+DATA SOURCE: CricketData.org (free tier: 100 requests/day - reasonable for
+this automation). Sign up at cricketdata.org, grab your API key from the
+dashboard, and set it as CRICKETDATA_API_KEY.
 
 Deploy: hamesha-on host chahiye (Railway/Render/VPS). GitHub Actions cron
 is NOT suitable - ye bot continuously polls dono Telegram aur CricketData.org.
@@ -50,21 +44,16 @@ log = logging.getLogger("group-prediction-bot")
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 GROUP_CHAT_ID = int(os.environ["GROUP_CHAT_ID"])
 ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()}
-RAPIDAPI_KEY = os.environ["RAPIDAPI_KEY"]
+CRICKETDATA_API_KEY = os.environ["CRICKETDATA_API_KEY"]
 
 DB_PATH = os.environ.get("DB_PATH", "predictions.db")
-CHECK_INTERVAL_MINUTES = int(os.environ.get("CHECK_INTERVAL_MINUTES", "720"))  # default: 2x/day, to stay within RapidAPI free tier's 100 requests/month
+CHECK_INTERVAL_MINUTES = int(os.environ.get("CHECK_INTERVAL_MINUTES", "10"))  # CricketData.org free tier = 100/day, 10 min is safe
 
 POINTS_WINNER = 10
 POINTS_SCORE = 15
 POINTS_MOM = 20
 
-CRICBUZZ_HOST = "cricbuzz-cricket.p.rapidapi.com"
-CRICBUZZ_BASE = f"https://{CRICBUZZ_HOST}"
-CRICBUZZ_HEADERS = {
-    "X-RapidAPI-Host": CRICBUZZ_HOST,
-    "X-RapidAPI-Key": RAPIDAPI_KEY,
-}
+CRICKETDATA_BASE = "https://api.cricapi.com/v1"
 
 SCORE_BUCKETS = {
     "t20": [140, 160, 180, 200],
@@ -148,90 +137,60 @@ def is_admin(user_id: int) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# RapidAPI - Cricbuzz Cricket calls
+# CricketData.org calls
 # ---------------------------------------------------------------------------
 
 async def fetch_matches(client: httpx.AsyncClient):
-    """
-    Returns a normalized list of dicts: [{id, status, matchType, teams: [a,b]}, ...]
-    Pulls from Cricbuzz's /matches/v1/live endpoint (live + upcoming + recent
-    are usually grouped under typeMatches -> seriesMatches -> matches).
-    Verify this shape in RapidAPI's Playground before first real run.
-    """
-    r = await client.get(f"{CRICBUZZ_BASE}/matches/v1/live", headers=CRICBUZZ_HEADERS)
+    r = await client.get(
+        f"{CRICKETDATA_BASE}/currentMatches",
+        params={"apikey": CRICKETDATA_API_KEY, "offset": 0},
+    )
     r.raise_for_status()
-    raw = r.json()
-
+    data = r.json().get("data", [])
     matches = []
-    for type_block in raw.get("typeMatches", []):
-        for series_block in type_block.get("seriesMatches", []):
-            wrapper = series_block.get("seriesAdWrapper") or series_block
-            for m in wrapper.get("matches", []):
-                info = m.get("matchInfo", {})
-                team1 = info.get("team1", {}).get("teamName")
-                team2 = info.get("team2", {}).get("teamName")
-                if not team1 or not team2:
-                    continue
-                state = (info.get("state") or "").lower()
-                matches.append({
-                    "id": str(info.get("matchId")),
-                    "status": (info.get("status") or "").lower(),
-                    "matchType": (info.get("matchFormat") or "").lower(),  # "test", "t20", "odi"
-                    # toss (or later) has happened once state moves off "preview"/"scheduled"
-                    "matchStarted": state not in ("preview", "scheduled", ""),
-                    "teams": [team1, team2],
-                })
+    for m in data:
+        teams = m.get("teams") or []
+        if len(teams) != 2:
+            continue
+        matches.append({
+            "id": m.get("id"),
+            "status": (m.get("status") or "").lower(),
+            "matchType": (m.get("matchType") or "").lower(),
+            "matchStarted": bool(m.get("matchStarted")),
+            "teams": teams,
+        })
     return matches
 
 
 async def fetch_squad(client: httpx.AsyncClient, cd_match_id: str):
-    """Returns player names for MOM options, from the match center's squads."""
-    r = await client.get(f"{CRICBUZZ_BASE}/mcenter/v1/{cd_match_id}", headers=CRICBUZZ_HEADERS)
+    r = await client.get(
+        f"{CRICKETDATA_BASE}/match_squad",
+        params={"apikey": CRICKETDATA_API_KEY, "id": cd_match_id},
+    )
     r.raise_for_status()
-    data = r.json()
-
+    data = r.json().get("data", [])
     players = []
-    for key in ("team1", "team2"):
-        team = data.get("matchInfo", {}).get(key, {})
-        for p in team.get("playerDetails", []) or team.get("players", []):
-            name = p.get("name") or p.get("fullName")
-            if name:
-                players.append(name)
+    for team in data:
+        for p in team.get("players", []):
+            players.append(p.get("name"))
     return players[:10] if players else []  # Telegram poll option limit is 10
 
 
 async def fetch_result(client: httpx.AsyncClient, cd_match_id: str):
-    """Returns (winner_team_name, winning_score_runs) once match has ended, else None."""
-    r = await client.get(f"{CRICBUZZ_BASE}/mcenter/v1/{cd_match_id}", headers=CRICBUZZ_HEADERS)
-    r.raise_for_status()
-    data = r.json()
-    info = data.get("matchInfo", {})
-
-    state = (info.get("state") or "").lower()
-    if state != "complete":
-        return None
-
-    result_text = (info.get("status") or "")
-    team1_name = info.get("team1", {}).get("teamName", "")
-    team2_name = info.get("team2", {}).get("teamName", "")
-
-    winner = None
-    if team1_name and team1_name.lower() in result_text.lower():
-        winner = team1_name
-    elif team2_name and team2_name.lower() in result_text.lower():
-        winner = team2_name
-    if not winner:
-        return None
-
-    # matchScore holds each team's innings (team1Score / team2Score -> inngs1/inngs2 -> runs)
-    score_key = "team1Score" if winner == team1_name else "team2Score"
-    team_score = data.get("matchScore", {}).get(score_key, {})
-    top_score = max(
-        (inning.get("runs", 0) for inning in team_score.values() if isinstance(inning, dict)),
-        default=0,
+    r = await client.get(
+        f"{CRICKETDATA_BASE}/match_info",
+        params={"apikey": CRICKETDATA_API_KEY, "id": cd_match_id},
     )
-
-    return winner, top_score
+    r.raise_for_status()
+    info = r.json().get("data", {})
+    if info.get("matchStarted") and info.get("matchEnded"):
+        winner = info.get("matchWinner")
+        top_score = 0
+        for s in info.get("score", []):
+            if winner and winner in s.get("inning", ""):
+                top_score = max(top_score, s.get("r", 0))
+        return winner, top_score
+    return None
 
 
 # ---------------------------------------------------------------------------
