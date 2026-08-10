@@ -141,8 +141,13 @@ def is_admin(user_id: int) -> bool:
 # ---------------------------------------------------------------------------
 
 async def fetch_matches(client: httpx.AsyncClient):
+    """
+    Uses /matches (not /currentMatches) since /currentMatches only returns
+    matches that have already started - /matches also includes upcoming
+    (not-yet-started) matches, which we need to catch the moment toss happens.
+    """
     r = await client.get(
-        f"{CRICKETDATA_BASE}/currentMatches",
+        f"{CRICKETDATA_BASE}/matches",
         params={"apikey": CRICKETDATA_API_KEY, "offset": 0},
     )
     r.raise_for_status()
