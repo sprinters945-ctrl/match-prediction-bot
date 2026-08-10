@@ -151,7 +151,11 @@ async def fetch_matches(client: httpx.AsyncClient):
         params={"apikey": CRICKETDATA_API_KEY, "offset": 0},
     )
     r.raise_for_status()
-    data = r.json().get("data", [])
+    raw = r.json()
+    data = raw.get("data", [])
+    if not data:
+        # DEBUG: log the raw response so we can see what's actually coming back
+        log.warning(f"fetch_matches got 0 matches. Raw response: {raw}")
     matches = []
     for m in data:
         teams = m.get("teams") or []
