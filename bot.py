@@ -211,12 +211,15 @@ async def poll_cycle(context: ContextTypes.DEFAULT_TYPE):
 
         conn = db()
 
+        log.info(f"poll_cycle: fetched {len(live_matches)} matches")
+
         for m in live_matches:
             cd_id = m.get("id")
             status = (m.get("status") or "").lower()
             match_type = (m.get("matchType") or "").lower()
             teams = m.get("teams") or []
             if len(teams) != 2:
+                log.info(f"skip {cd_id}: doesn't have exactly 2 teams ({teams})")
                 continue
             team_a, team_b = teams
 
@@ -225,6 +228,12 @@ async def poll_cycle(context: ContextTypes.DEFAULT_TYPE):
             ).fetchone()
 
             toss_done = "toss" in status or "elected" in status or m.get("matchStarted")
+            log.info(
+                f"match {cd_id} ({team_a} vs {team_b}): status='{status}' "
+                f"matchType='{match_type}' matchStarted={m.get('matchStarted')} "
+                f"toss_done={toss_done} existing={bool(existing)} "
+                f"eligible_format={match_type in SCORE_BUCKETS}"
+            )
             if not existing and toss_done and match_type in SCORE_BUCKETS:
                 try:
                     players = await fetch_squad(client, cd_id)
@@ -458,4 +467,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-  
