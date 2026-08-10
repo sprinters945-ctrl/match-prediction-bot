@@ -168,11 +168,15 @@ async def fetch_squad(client: httpx.AsyncClient, cd_match_id: str):
         params={"apikey": CRICKETDATA_API_KEY, "id": cd_match_id},
     )
     r.raise_for_status()
-    data = r.json().get("data", [])
+    raw = r.json()
+    data = raw.get("data", [])
     players = []
     for team in data:
         for p in team.get("players", []):
             players.append(p.get("name"))
+    if len(players) < 2:
+        # DEBUG: log the raw response so we can see the actual field names
+        log.warning(f"fetch_squad got too few players for match {cd_match_id}. Raw response: {raw}")
     return players[:10] if players else []  # Telegram poll option limit is 10
 
 
@@ -454,3 +458,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+  
